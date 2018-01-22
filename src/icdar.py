@@ -14,7 +14,7 @@ import tensorflow as tf
 
 from data_util import GeneratorEnqueuer
 
-tf.app.flags.DEFINE_string('training_data_path', '/media/zhaoke/b0685ee4-63e3-4691-ae02-feceacff6996/data/',
+tf.app.flags.DEFINE_string('training_data_path', '/home/share/model_share/for_zhao/merge/merge/',
                            'training dataset to use')
 tf.app.flags.DEFINE_integer('max_image_large_side', 1280,
                             'max image size of training')
@@ -28,6 +28,8 @@ tf.app.flags.DEFINE_float('min_crop_side_ratio', 0.1,
                           'min length of min(H, W')
 tf.app.flags.DEFINE_string('geometry', 'RBOX',
                            'which geometry to generate, RBOX or QUAD')
+tf.app.flags.DEFINE_float('min_ratio', 0.2, 'the uncovering ratio')
+tf.app.flags.DEFINE_float('max_ratio', 0.5, 'the covering ratio')
 
 
 FLAGS = tf.app.flags.FLAGS
@@ -111,8 +113,43 @@ def check_and_validate_polys(polys, tags, xxx_todo_changeme):
         validated_tags.append(tag)
     return np.array(validated_polys), np.array(validated_tags)
 
+def get_interset_ratios(poly, polys):
+    a = Polygon(poly)
+    ret = []
+    for i in polys:
+        b = Polygon(i)
+        ret.append((a.intersection(b)).area/a.area)
+    return np.array(ret)
 
-def crop_area(im, polys, tags, crop_background=False, max_tries=50):
+def get_y(poly, x):
+    p0p1 = fit_line([poly[0, 0], poly[1, 0]], [poly[0, 1], poly[1, 1]])
+    p2p3 = fit_line([poly[2, 0], poly[3, 0]], [poly[2, 1], poly[3, 1]])
+    y0 = -(p0p1[0]*x+p0p1[2])/p0p1[1]
+    y1 = -(p2p3[0]*x+p2p3[2])/p2p3[1]
+    ymin = min(y0, y1)
+    ymax = max(y0, y1)
+    ymin = np.int(np.clip(ymin, 0, np.max(poly[:, 1])))
+    ymax = np.int(np.clip(ymax, 0, np.max(poly[:, 1])))
+    return np.random.choice(range(ymin, ymax))
+
+def get_xy(x, y, w, thelta):
+    if thelta >= 0:
+        poly = np.array([[-w*np.sin(thelta), -w*np.cos(thelta)],
+                         [np.sqrt(2)*w*np.cos(thelta+np.pi/4), -np.sqrt(2)*w*np.sin(thelta+np.pi/4)],
+                         [w*np.cos(thelta), -w*np.sin(thelta)],
+                         [0, 0]])
+        bias = np.array([[x-np.sqrt(2)/2*w*np.cos(thelta+np.pi/4), y+np.sqrt(2)/2*w*np.sin(thelta+np.pi/4)]])
+        return poly + bias
+    else:
+        poly = np.array([[-np.sqrt(2)*w*np.cos(np.pi/4-thelta), -np.sqrt(2)*w*np.sin(np.pi/4-thelta)],
+                         [w*np.sin(-thelta), -w*np.cos(thelta)],
+                         [0, 0],
+                         [-w*np.cos(thelta), w*np.sin(thelta)]])
+        bias = np.array([[x+np.sqrt(2)/2*w*np.cos(np.pi/4-thelta), y+np.sqrt(2)/2*w*np.sin(np.pi/4-thelta)]])
+        return poly + bias
+
+
+def crop_area(im, polys, tags, size=32, crop_background=False, max_tries=50):
     '''
     make random crop from the input image
     :param im:
@@ -123,57 +160,66 @@ def crop_area(im, polys, tags, crop_background=False, max_tries=50):
     :return:
     '''
     h, w, _ = im.shape
-    pad_h = h//10
-    pad_w = w//10
-    h_array = np.zeros((h + pad_h*2), dtype=np.int32)
-    w_array = np.zeros((w + pad_w*2), dtype=np.int32)
+    h_array = np.zeros((h), dtype=np.int32)
+    w_array = np.zeros((w), dtype=np.int32)
+    if not crop_background:
+        index = np.random.choice(range(len(polys)))
+        polys = polys[index:index+1]
     for poly in polys:
         poly = np.round(poly, decimals=0).astype(np.int32)
         minx = np.min(poly[:, 0])
         maxx = np.max(poly[:, 0])
-        w_array[minx+pad_w:maxx+pad_w] = 1
+        w_array[minx:maxx] = 1
         miny = np.min(poly[:, 1])
         maxy = np.max(poly[:, 1])
-        h_array[miny+pad_h:maxy+pad_h] = 1
+        h_array[miny:maxy] = 1
     # ensure the cropped area not across a text
     h_axis = np.where(h_array == 0)[0]
     w_axis = np.where(w_array == 0)[0]
-    if len(h_axis) == 0 or len(w_axis) == 0:
-        return im, polys, tags
+    pts2 = np.array([[0, 0], [size, 0], [size, size], [0, size]]).astype(np.float32)
     for i in range(max_tries):
-        xx = np.random.choice(w_axis, size=2)
-        xmin = np.min(xx) - pad_w
-        xmax = np.max(xx) - pad_w
-        xmin = np.clip(xmin, 0, w-1)
-        xmax = np.clip(xmax, 0, w-1)
-        yy = np.random.choice(h_axis, size=2)
-        ymin = np.min(yy) - pad_h
-        ymax = np.max(yy) - pad_h
-        ymin = np.clip(ymin, 0, h-1)
-        ymax = np.clip(ymax, 0, h-1)
-        if xmax - xmin < FLAGS.min_crop_side_ratio*w or ymax - ymin < FLAGS.min_crop_side_ratio*h:
-            # area too small
-            continue
-        if polys.shape[0] != 0:
-            poly_axis_in_area = (polys[:, :, 0] >= xmin) & (polys[:, :, 0] <= xmax) \
-                                & (polys[:, :, 1] >= ymin) & (polys[:, :, 1] <= ymax)
-            selected_polys = np.where(np.sum(poly_axis_in_area, axis=1) == 4)[0]
-        else:
-            selected_polys = []
-        if len(selected_polys) == 0:
-            # no text in this area
-            if crop_background:
-                return im[ymin:ymax+1, xmin:xmax+1, :], polys[selected_polys], tags[selected_polys]
+        if crop_background:
+            xx = np.random.choice(w_axis)
+            yy = np.random.choice(h_axis)
+            ww = size * (0.7 + 0.6*np.random.random())
+            thelta = np.pi * (np.random.random() - 0.5)
+            poly = get_xy(xx, yy, ww, thelta)
+            ratios = get_interset_ratios(poly, polys)
+            if np.max(ratios) <= FLAGS.min_ratio:
+                poly = poly.astype(np.int)
+                minx = np.min(poly[:, 0])
+                maxx = np.max(poly[:, 0])
+                miny = np.min(poly[:, 1])
+                maxy = np.max(poly[:, 1])
+                chopped_im = im[miny:maxy, minx:maxx]
+                pts1 = (poly - [minx, miny]).astype(np.float32)
+                M = cv2.getPerspectiveTransform(pts1, pts2)
+                dst = cv2.warpPerspective(chopped_im, M, (size, size))
+                return dst
             else:
                 continue
-        im = im[ymin:ymax+1, xmin:xmax+1, :]
-        polys = polys[selected_polys]
-        tags = tags[selected_polys]
-        polys[:, :, 0] -= xmin
-        polys[:, :, 1] -= ymin
-        return im, polys, tags
-
-    return im, polys, tags
+        else:
+            xx = np.random.choice(range(np.min(polys[:, 0]), np.max(polys[:, 0])))
+            yy = get_y(poly, xx)
+            lenght = np.sqrt(np.sum(np.square(poly[0]-poly[3])))
+            ww = lenght * (0.7 + 0.6*np.random.random())
+            thelta = np.pi * (np.random.random() - 0.5)
+            poly = get_xy(xx, yy, ww, thelta)
+            ratios = get_interset_ratios(poly, polys)
+            if np.max(ratios) >= FLAGS.max_ratio:
+                poly = poly.astype(np.int)
+                minx = np.min(poly[:, 0])
+                maxx = np.max(poly[:, 0])
+                miny = np.min(poly[:, 1])
+                maxy = np.max(poly[:, 1])
+                chopped_im = im[miny:maxy, minx:maxx]
+                pts1 = (poly - [minx, miny]).astype(np.float32)
+                M = cv2.getPerspectiveTransform(pts1, pts2)
+                dst = cv2.warpPerspective(chopped_im, M, (size, size))
+                return dst
+            else:
+                continue
+    return None
 
 
 def shrink_poly(poly, r):
@@ -599,10 +645,7 @@ def generator(input_size=512, batch_size=32,
     while True:
         np.random.shuffle(index)
         images = []
-        image_fns = []
         score_maps = []
-        geo_maps = []
-        training_masks = []
         for i in index:
             try:
                 im_fn = image_list[i]
@@ -626,46 +669,17 @@ def generator(input_size=512, batch_size=32,
                 # random crop a area from image
                 if np.random.rand() < background_ratio:
                     # crop background
-                    im, text_polys, text_tags = crop_area(im, text_polys, text_tags, crop_background=True)
-                    if text_polys.shape[0] > 0:
+                    im = crop_area(im, text_polys, text_tags, crop_background=True)
+                    if im is None:
                         # cannot find background
                         continue
-                    # pad and resize image
-                    new_h, new_w, _ = im.shape
-                    max_h_w_i = np.max([new_h, new_w, input_size])
-                    im_padded = np.zeros((max_h_w_i, max_h_w_i, 3), dtype=np.uint8)
-                    im_padded[:new_h, :new_w, :] = im.copy()
-                    im = cv2.resize(im_padded, dsize=(input_size, input_size))
-                    score_map = np.zeros((input_size, input_size), dtype=np.uint8)
-                    geo_map_channels = 5 if FLAGS.geometry == 'RBOX' else 8
-                    geo_map = np.zeros((input_size, input_size, geo_map_channels), dtype=np.float32)
-                    training_mask = np.ones((input_size, input_size), dtype=np.uint8)
                 else:
-                    im, text_polys, text_tags = crop_area(im, text_polys, text_tags, crop_background=False)
-                    if text_polys.shape[0] == 0:
+                    im = crop_area(im, text_polys, text_tags, crop_background=False)
+                    if im is None:
                         continue
-                    h, w, _ = im.shape
-
-                    # pad the image to the training input size or the longer side of image
-                    new_h, new_w, _ = im.shape
-                    max_h_w_i = np.max([new_h, new_w, input_size])
-                    im_padded = np.zeros((max_h_w_i, max_h_w_i, 3), dtype=np.uint8)
-                    im_padded[:new_h, :new_w, :] = im.copy()
-                    im = im_padded
-                    # resize the image to input size
-                    new_h, new_w, _ = im.shape
-                    resize_h = input_size
-                    resize_w = input_size
-                    im = cv2.resize(im, dsize=(resize_w, resize_h))
-                    resize_ratio_3_x = resize_w/float(new_w)
-                    resize_ratio_3_y = resize_h/float(new_h)
-                    text_polys[:, :, 0] *= resize_ratio_3_x
-                    text_polys[:, :, 1] *= resize_ratio_3_y
-                    new_h, new_w, _ = im.shape
-                    score_map, geo_map, training_mask = generate_rbox((new_h, new_w), text_polys, text_tags)
 
                 if vis:
-                    fig, axs = plt.subplots(3, 2, figsize=(20, 30))
+                    fig, axs = plt.subplots(1, 1)
                     # axs[0].imshow(im[:, :, ::-1])
                     # axs[0].set_xticks([])
                     # axs[0].set_yticks([])
@@ -679,47 +693,35 @@ def generator(input_size=512, batch_size=32,
                     # axs[1].imshow(score_map)
                     # axs[1].set_xticks([])
                     # axs[1].set_yticks([])
-                    axs[0, 0].imshow(im[:, :, ::-1])
-                    axs[0, 0].set_xticks([])
-                    axs[0, 0].set_yticks([])
+                    axs.imshow(im[:, :, ::-1])
+                    axs.set_xticks([])
+                    axs.set_yticks([])
                     for poly in text_polys:
                         poly_h = min(abs(poly[3, 1] - poly[0, 1]), abs(poly[2, 1] - poly[1, 1]))
                         poly_w = min(abs(poly[1, 0] - poly[0, 0]), abs(poly[2, 0] - poly[3, 0]))
-                        axs[0, 0].add_artist(Patches.Polygon(
+                        axs.add_artist(Patches.Polygon(
                             poly, facecolor='none', edgecolor='green', linewidth=2, linestyle='-', fill=True))
-                        axs[0, 0].text(poly[0, 0], poly[0, 1], '{:.0f}-{:.0f}'.format(poly_h, poly_w), color='purple')
-                    axs[0, 1].imshow(score_map[::, ::])
-                    axs[0, 1].set_xticks([])
-                    axs[0, 1].set_yticks([])
-                    axs[1, 0].imshow(geo_map[::, ::, 0])
-                    axs[1, 0].set_xticks([])
-                    axs[1, 0].set_yticks([])
-                    axs[1, 1].imshow(geo_map[::, ::, 1])
-                    axs[1, 1].set_xticks([])
-                    axs[1, 1].set_yticks([])
-                    axs[2, 0].imshow(geo_map[::, ::, 2])
-                    axs[2, 0].set_xticks([])
-                    axs[2, 0].set_yticks([])
-                    axs[2, 1].imshow(training_mask[::, ::])
-                    axs[2, 1].set_xticks([])
-                    axs[2, 1].set_yticks([])
+                        axs.text(poly[0, 0], poly[0, 1], '{:.0f}-{:.0f}'.format(poly_h, poly_w), color='purple')
+                    #axs[0, 0].imshow(im[:, :, ::-1])
+                    #axs[0, 0].set_xticks([])
+                    #axs[0, 0].set_yticks([])
+                    #for poly in text_polys:
+                        #poly_h = min(abs(poly[3, 1] - poly[0, 1]), abs(poly[2, 1] - poly[1, 1]))
+                        #poly_w = min(abs(poly[1, 0] - poly[0, 0]), abs(poly[2, 0] - poly[3, 0]))
+                        #axs[0, 0].add_artist(Patches.Polygon(
+                            #poly, facecolor='none', edgecolor='green', linewidth=2, linestyle='-', fill=True))
+                        #axs[0, 0].text(poly[0, 0], poly[0, 1], '{:.0f}-{:.0f}'.format(poly_h, poly_w), color='purple')
                     plt.tight_layout()
                     plt.show()
                     plt.close()
 
                 images.append(im[:, :, ::-1].astype(np.float32))
-                image_fns.append(im_fn)
-                score_maps.append(score_map[::4, ::4, np.newaxis].astype(np.float32))
-                geo_maps.append(geo_map[::4, ::4, :].astype(np.float32))
-                training_masks.append(training_mask[::4, ::4, np.newaxis].astype(np.float32))
+                #score_maps.append(score_map[::4, ::4, np.newaxis].astype(np.float32))
 
                 if len(images) == batch_size:
-                    yield images, image_fns, score_maps, geo_maps, training_masks
+                    yield images, score_maps
                     images = []
-                    image_fns = []
                     score_maps = []
-                    geo_maps = []
-                    training_masks = []
             except Exception as e:
                 import traceback
                 traceback.print_exc()
@@ -747,9 +749,15 @@ def get_batch(num_workers, **kwargs):
 
 
 if __name__ == '__main__':
-    a = generator(input_size=512, batch_size=1, vis=False)
+    #p = np.array([[-90, 110], [0, 20], [-20, 0], [-110, 90]])
+    #results = []
+    #while True:
+        #x = -110*np.random.random()
+        #y = get_y(p, x)
+        #results.append((int(x), y))
+    a = generator(input_size=32, batch_size=1, background_ratio=0, vis=True)
     cnt = 0
     for i in range(100):
-        img, d, y_true, b, c = next(a)
+        img, y_true = next(a)
         cnt += 1
     print 'end'
